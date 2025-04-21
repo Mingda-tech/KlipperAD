@@ -17,6 +17,7 @@ class ManualStepper:
             self.rail = stepper.PrinterRail(
                 config, need_position_minmax=False, default_position_endstop=0.)
             self.steppers = self.rail.get_steppers()
+            self.homed_flag = False
         else:
             self.can_home = False
             self.rail = stepper.PrinterStepper(config)
@@ -68,9 +69,12 @@ class ManualStepper:
         toolhead.register_step_generator(self.rail.generate_steps)
         self._set_pressure_advance(self.config_pa, self.config_smooth_time)
     def get_status(self, eventtime):
-        return {'pressure_advance': self.pressure_advance,
+        state = {'pressure_advance': self.pressure_advance,
                 'smooth_time': self.pressure_advance_smooth_time,
                 'motion_queue': self.motion_queue}
+        if self.can_home:
+            state['homed'] = self.homed_flag
+        return state
     def _set_pressure_advance(self, pressure_advance, smooth_time):
         old_smooth_time = self.pressure_advance_smooth_time
         if not self.pressure_advance:
@@ -154,6 +158,8 @@ class ManualStepper:
             for s in self.steppers:
                 se = stepper_enable.lookup_enable(s.get_name())
                 se.motor_disable(self.next_cmd_time)
+            if self.can_home:
+                self.homed_flag = False
         self.sync_print_time()
     def do_set_position(self, setpos):
         self.rail.set_position([setpos, 0., 0.])
@@ -185,6 +191,8 @@ class ManualStepper:
         phoming = self.printer.lookup_object('homing')
         phoming.manual_home(self, endstops, pos, speed,
                             triggered, check_trigger)
+        if self.can_home:
+            self.homed_flag = True
     cmd_MANUAL_STEPPER_help = "Command a manually configured stepper"
     def cmd_MANUAL_STEPPER(self, gcmd):
         if self.motion_queue is not None:
