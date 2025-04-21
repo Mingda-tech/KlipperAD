@@ -9,6 +9,8 @@ from . import bulk_sensor
 #
 # Constants
 #
+BYTES_PER_SAMPLE = 4  # samples are 4 byte wide unsigned integers
+MAX_SAMPLES_PER_MESSAGE = bulk_sensor.MAX_BULK_MSG_SIZE // BYTES_PER_SAMPLE
 UPDATE_INTERVAL = 0.10
 SAMPLE_ERROR_DESYNC = -0x80000000
 SAMPLE_ERROR_LONG_READ = 0x40000000
@@ -39,18 +41,26 @@ class HX71xBase:
         # Samples per second choices
         self.sps = config.getchoice('sample_rate', sample_rate_options,
                                     default=default_sample_rate)
+        # self.sps = int(0.8 * self.sps)
+        # Maximum number of error samples per data processing
+        self.max_error_samples_num = config.getint('error_num', default=0,
+                                                   minval=0, maxval=10)
+        # (1.0/self.sps)*MAX_SAMPLES_PER_MESSAGE == MAX_SAMPLES_PER_MESSAGE/self.sps
+        min_batch_time = UPDATE_INTERVAL
+        if (UPDATE_INTERVAL < (MAX_SAMPLES_PER_MESSAGE/self.sps)):
+            min_batch_time = ((MAX_SAMPLES_PER_MESSAGE/self.sps) * 1.2)
         # gain/channel choices
         self.gain_channel = int(config.getchoice('gain', gain_options,
                                                  default=default_gain))
         ## Bulk Sensor Setup
         self.bulk_queue = bulk_sensor.BulkDataQueue(mcu, oid=self.oid)
         # Clock tracking
-        chip_smooth = self.sps * UPDATE_INTERVAL * 2
+        chip_smooth = self.sps * min_batch_time * 2
         self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
         # Process messages in batches
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch, self._start_measurements,
-            self._finish_measurements, UPDATE_INTERVAL)
+            self._finish_measurements, min_batch_time)
         # Command Configuration
         self.query_hx71x_cmd = None
         mcu.add_config_cmd(
@@ -77,7 +87,7 @@ class HX71xBase:
     # returns a tuple of the minimum and maximum value of the sensor, used to
     # detect if a data value is saturated
     def get_range(self):
-        return -0x800000, 0x7FFFFF
+        return 0x000000, 0xFFFFFFF
 
     # add_client interface, direct pass through to bulk_sensor API
     def add_client(self, callback):
@@ -87,10 +97,18 @@ class HX71xBase:
     def _convert_samples(self, samples):
         adc_factor = 1. / (1 << 23)
         count = 0
+        continuous_counter = 0
         for ptime, val in samples:
             if val == SAMPLE_ERROR_DESYNC or val == SAMPLE_ERROR_LONG_READ:
                 self.last_error_count += 1
-                break  # additional errors are duplicates
+                # break  # additional errors are duplicates
+                continuous_counter += 1
+                continue
+            else:
+                continuous_counter = 0
+            if continuous_counter > self.max_error_samples_num:
+                # A sequential error occurs, exit early
+                break
             samples[count] = (round(ptime, 6), val, round(val * adc_factor, 9))
             count += 1
         del samples[count:]
@@ -100,10 +118,10 @@ class HX71xBase:
         self.consecutive_fails = 0
         self.last_error_count = 0
         # Start bulk reading
-        rest_ticks = self.mcu.seconds_to_clock(1. / (10. * self.sps))
+        rest_ticks = self.mcu.seconds_to_clock(1. / self.sps)
         self.query_hx71x_cmd.send([self.oid, rest_ticks])
-        logging.info("%s starting '%s' measurements",
-                     self.sensor_type, self.name)
+        logging.info("%s starting '%s' measurements, oid:%s, tick:%s",
+                     self.sensor_type, self.name, self.oid, rest_ticks)
         # Initialize clock tracking
         self.ffreader.note_start()
 
@@ -121,10 +139,12 @@ class HX71xBase:
         prev_overflows = self.ffreader.get_last_overflows()
         prev_error_count = self.last_error_count
         samples = self.ffreader.pull_samples()
+        # logging.info("_p_b:%s" % (samples,))
         self._convert_samples(samples)
+
         overflows = self.ffreader.get_last_overflows() - prev_overflows
         errors = self.last_error_count - prev_error_count
-        if errors > 0:
+        if errors > self.max_error_samples_num:
             logging.error("%s: Forced sensor restart due to error", self.name)
             self._finish_measurements()
             self._start_measurements()
@@ -137,8 +157,8 @@ class HX71xBase:
                 self._start_measurements()
         else:
             self.consecutive_fails = 0
-        return {'data': samples, 'errors': self.last_error_count,
-                'overflows': self.ffreader.get_last_overflows()}
+        return {'data': samples, 'errors': errors,
+                'overflows': overflows}
 
 
 def HX711(config):

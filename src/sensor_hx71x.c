@@ -21,6 +21,8 @@ struct hx71x_adc {
     uint8_t flags;
     uint32_t rest_ticks;
     uint32_t last_error;
+    uint32_t old_data; // save old data
+    uint32_t query_ticks;
     struct gpio_in dout; // pin used to receive data from the hx71x
     struct gpio_out sclk; // pin used to generate clock for the hx71x
     struct sensor_bulk sb;
@@ -40,27 +42,13 @@ static struct task_wake wake_hx71x;
 /****************************************************************
  * Low-level bit-banging
  ****************************************************************/
-
-#define MIN_PULSE_TIME nsecs_to_ticks(200)
+#define PULSE_TIME_NS_NUM 200
+#define MIN_PULSE_TIME nsecs_to_ticks(PULSE_TIME_NS_NUM)
 
 static uint32_t
 nsecs_to_ticks(uint32_t ns)
 {
     return timer_from_us(ns * 1000) / 1000000;
-}
-
-// Pause for 200ns
-static void
-hx71x_delay_noirq(void)
-{
-    if (CONFIG_MACH_AVR) {
-        // Optimize avr, as calculating time takes longer than needed delay
-        asm("nop\n    nop");
-        return;
-    }
-    uint32_t end = timer_read_time() + MIN_PULSE_TIME;
-    while (timer_is_before(timer_read_time(), end))
-        ;
 }
 
 // Pause for a minimum of 200ns
@@ -83,12 +71,17 @@ hx71x_raw_read(struct gpio_in dout, struct gpio_out sclk, int num_bits)
     while (num_bits--) {
         irq_disable();
         gpio_out_toggle_noirq(sclk);
-        hx71x_delay_noirq();
+        irq_enable();
+
+        hx71x_delay();
+
+        irq_disable();
         gpio_out_toggle_noirq(sclk);
         uint_fast8_t bit = gpio_in_read(dout);
-        irq_enable();
-        hx71x_delay();
         bits_read = (bits_read << 1) | bit;
+        irq_enable();
+
+        hx71x_delay();
     }
     return bits_read;
 }
@@ -112,16 +105,7 @@ hx71x_event(struct timer *timer)
     struct hx71x_adc *hx71x = container_of(timer, struct hx71x_adc, timer);
     uint32_t rest_ticks = hx71x->rest_ticks;
     uint8_t flags = hx71x->flags;
-    if (flags & HX_PENDING) {
-        hx71x->sb.possible_overflows++;
-        hx71x->flags = HX_PENDING | HX_OVERFLOW;
-        rest_ticks *= 4;
-    } else if (hx71x_is_data_ready(hx71x)) {
-        // New sample pending
-        hx71x->flags = HX_PENDING;
-        sched_wake_task(&wake_hx71x);
-        rest_ticks *= 8;
-    }
+    sched_wake_task(&wake_hx71x);
     hx71x->timer.waketime += rest_ticks;
     return SF_RESCHEDULE;
 }
@@ -147,25 +131,38 @@ hx71x_read_adc(struct hx71x_adc *hx71x, uint8_t oid)
 {
     // Read from sensor
     uint_fast8_t gain_channel = hx71x->gain_channel;
-    uint32_t adc = hx71x_raw_read(hx71x->dout, hx71x->sclk, 24 + gain_channel);
-
-    // Clear pending flag (and note if an overflow occurred)
-    irq_disable();
+    uint32_t adc = hx71x->old_data;
+    uint32_t counts = adc;
     uint8_t flags = hx71x->flags;
-    hx71x->flags = 0;
-    irq_enable();
+    if (hx71x_is_data_ready(hx71x)) {
+        // New sample pending
+        hx71x->flags = HX_PENDING;
+        uint32_t time1 = timer_read_time();
+        adc = hx71x_raw_read(hx71x->dout, hx71x->sclk, 24 + gain_channel);
+        uint32_t time2 = timer_read_time();
+        hx71x->query_ticks = time2 - time1;
 
-    // Extract report from raw data
-    uint32_t counts = adc >> gain_channel;
-    if (counts & 0x800000)
-        counts |= 0xFF000000;
+        irqstatus_t flag = irq_save();
+        
+        // Clear pending flag (and note if an overflow occurred)
+        hx71x->flags = 0;
+        hx71x->last_error = 0;
+        // Extract report from raw data
+        counts = (adc >> gain_channel) ^ 0x800000;
 
-    // Check for errors
-    uint_fast8_t extras_mask = (1 << gain_channel) - 1;
-    if ((adc & extras_mask) != extras_mask) {
-        // Transfer did not complete correctly
-        hx71x->last_error = SAMPLE_ERROR_DESYNC;
-    } else if (flags & HX_OVERFLOW) {
+        // Check for errors
+        uint_fast8_t extras_mask = (1 << gain_channel) - 1;
+        if ((adc & extras_mask) != extras_mask) {
+            // Transfer did not complete correctly
+            hx71x->last_error = SAMPLE_ERROR_DESYNC;
+        }
+        
+        irq_restore(flag);
+        
+    }
+    else if (flags & HX_PENDING) {
+        hx71x->sb.possible_overflows++;
+        hx71x->flags |= HX_OVERFLOW;
         // Transfer took too long
         hx71x->last_error = SAMPLE_ERROR_READ_TOO_LONG;
     }
@@ -177,6 +174,7 @@ hx71x_read_adc(struct hx71x_adc *hx71x, uint8_t oid)
 
     // Add measurement to buffer
     add_sample(hx71x, oid, counts, false);
+    hx71x->old_data = counts;
 }
 
 // Create a hx71x sensor
@@ -233,7 +231,8 @@ command_query_hx71x_status(const uint32_t *args)
     uint8_t is_data_ready = hx71x_is_data_ready(hx71x);
     irq_enable();
     uint8_t pending_bytes = is_data_ready ? BYTES_PER_SAMPLE : 0;
-    sensor_bulk_status(&hx71x->sb, oid, start_t, 0, pending_bytes);
+    sensor_bulk_status(&hx71x->sb, oid, start_t, hx71x->query_ticks,
+                        pending_bytes);
 }
 DECL_COMMAND(command_query_hx71x_status, "query_hx71x_status oid=%c");
 
@@ -246,8 +245,7 @@ hx71x_capture_task(void)
     uint8_t oid;
     struct hx71x_adc *hx71x;
     foreach_oid(oid, hx71x, command_config_hx71x) {
-        if (hx71x->flags)
-            hx71x_read_adc(hx71x, oid);
+        hx71x_read_adc(hx71x, oid);
     }
 }
 DECL_TASK(hx71x_capture_task);
