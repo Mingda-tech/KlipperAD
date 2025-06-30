@@ -4,10 +4,11 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-from . import hx71x
+from . import hx71x, probe, cs1237
 from . import ads1220
 from .bulk_sensor import BatchWebhooksClient
 import collections, itertools
+import chelper, logging, math, mcu
 # We want either Python 3's zip() or Python 2's izip() but NOT 2's zip():
 zip_impl = zip
 try:
@@ -67,18 +68,28 @@ class LoadCellCommandHelper:
     def register_commands(self, name):
         # Register commands
         gcode = self.printer.lookup_object('gcode')
-        gcode.register_mux_command("LOAD_CELL_TARE", "LOAD_CELL", name,
-                                   self.cmd_LOAD_CELL_TARE,
-                                   desc=self.cmd_LOAD_CELL_TARE_help)
-        gcode.register_mux_command("LOAD_CELL_CALIBRATE", "LOAD_CELL", name,
-                                   self.cmd_LOAD_CELL_CALIBRATE,
-                                   desc=self.cmd_CALIBRATE_LOAD_CELL_help)
-        gcode.register_mux_command("LOAD_CELL_READ", "LOAD_CELL", name,
-                                   self.cmd_LOAD_CELL_READ,
-                                   desc=self.cmd_LOAD_CELL_READ_help)
-        gcode.register_mux_command("LOAD_CELL_DIAGNOSTIC", "LOAD_CELL", name,
-                                   self.cmd_LOAD_CELL_DIAGNOSTIC,
-                                   desc=self.cmd_LOAD_CELL_DIAGNOSTIC_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_TARE", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_TARE, desc=self.cmd_LOAD_CELL_TARE_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_CALIBRATE", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_CALIBRATE,
+            desc=self.cmd_CALIBRATE_LOAD_CELL_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_READ", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_READ, desc=self.cmd_LOAD_CELL_READ_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_DIAGNOSTIC", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_DIAGNOSTIC,
+            desc=self.cmd_LOAD_CELL_DIAGNOSTIC_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_START_STREAMING", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_START_STREAMING,
+            desc=self.cmd_LOAD_CELL_START_STREAMING_help)
+        gcode.register_mux_command(
+            "LOAD_CELL_STOP_STREAMING", "LOAD_CELL", name,
+            self.cmd_LOAD_CELL_STOP_STREAMING,
+            desc=self.cmd_LOAD_CELL_STOP_STREAMING_help)
 
     cmd_LOAD_CELL_TARE_help = "Set the Zero point of the load cell"
     def cmd_LOAD_CELL_TARE(self, gcmd):
@@ -144,6 +155,13 @@ class LoadCellCommandHelper:
         gcmd.respond_info("Sample range / sensor capacity: %.5f%%"
                           % ((max_pct - min_pct) / 2.))
 
+    cmd_LOAD_CELL_START_STREAMING_help = "Load cell start streaming!"
+    def cmd_LOAD_CELL_START_STREAMING(self, gcmd):
+        self.load_cell._start_streaming()
+    cmd_LOAD_CELL_STOP_STREAMING_help = "Load cell stop streaming!"
+    def cmd_LOAD_CELL_STOP_STREAMING(self, gcmd):
+        self.load_cell._finish_streaming()
+
 # Class to guide the user through calibrating a load cell
 class LoadCellGuidedCalibrationHelper:
     def __init__(self, printer, load_cell):
@@ -197,7 +215,8 @@ class LoadCellGuidedCalibrationHelper:
         if self._counts_per_gram is None or self._tare_counts is None:
             self.gcode.respond_info("Calibration process is incomplete, "
                                     "aborting")
-        self.load_cell.set_calibration(self._counts_per_gram, self._tare_counts)
+        self.load_cell.set_calibration(
+            self._counts_per_gram, self._tare_counts)
         self.gcode.respond_info("Load cell calibration settings:\n\n"
             "counts_per_gram: %.6f\n"
             "reference_tare_counts: %i\n\n"
@@ -250,7 +269,8 @@ class LoadCellGuidedCalibrationHelper:
         if cal_counts == self._tare_counts:
             raise self.printer.command_error(
                 "ERROR: Tare and Calibration readings are the same!\n"
-                "Check wiring and validate sensor with READ_LOAD_CELL command.")
+                "Check wiring and validate sensor with "\
+                "READ_LOAD_CELL command.")
         if (abs(cal_percent - self.tare_percent)) < 1.:
             raise self.printer.command_error(
                 "ERROR: Tare and Calibration readings are less than 1% "
@@ -259,10 +279,12 @@ class LoadCellGuidedCalibrationHelper:
         # only set _counts_per_gram after all errors are raised
         self._counts_per_gram = c_per_g
         if cap_kg < 1.:
-            gcmd.respond_info("WARNING: Load cell capacity is less than 1kg!\n"
+            gcmd.respond_info(
+                "WARNING: Load cell capacity is less than 1kg!\n"
                 "Check wiring and consider using a lower sensor gain.")
         if cap_kg > 25.:
-            gcmd.respond_info("WARNING: Load cell capacity is more than 25Kg!\n"
+            gcmd.respond_info(
+                "WARNING: Load cell capacity is more than 25Kg!\n"
                 "Check wiring and consider using a higher sensor gain.")
         gcmd.respond_info("Accept calibration with the ACCEPT command.")
 
@@ -288,6 +310,7 @@ class LoadCellSampleCollector:
 
     def _on_samples(self, msg):
         if not self.is_started:
+            del self._samples[:]
             return False  # already stopped, ignore
         self._errors += msg['errors']
         self._overflows += msg['overflows']
@@ -367,6 +390,7 @@ class LoadCell:
         self.sensor = sensor   # must implement BulkSensorAdc
         buffer_size = sensor.get_samples_per_second() // 2
         self._force_buffer = collections.deque(maxlen=buffer_size)
+        self._force_buffer_raw = collections.deque(maxlen=buffer_size)
         self.reference_tare_counts = config.getint('reference_tare_counts',
                                                    default=None)
         self.tare_counts = self.reference_tare_counts
@@ -375,17 +399,24 @@ class LoadCell:
         self.invert = config.getchoice('sensor_orientation',
                         {'normal': 1., 'inverted': -1.}, default="normal")
         LoadCellCommandHelper(config, self)
+        # Probe interface
+        self.mcu_probe = LoadCellEndstop(config, self)
+        self.cmd_helper = probe.ProbeCommandHelper(
+            config, self, self.mcu_probe.query_endstop)
+        self.probe_offsets = probe.ProbeOffsetsHelper(config)
+        self.probe_session = probe.ProbeSessionHelper(config, self.mcu_probe)
         # Client support:
         self.clients = ApiClientHelper(printer)
+        self._need_stop = True
         header = {"header": ["time", "force (g)", "counts", "tare_counts"]}
         self.clients.add_mux_endpoint("load_cell/dump_force",
                                       "load_cell", self.name, header)
         # startup, when klippy is ready, start capturing data
         printer.register_event_handler("klippy:ready", self._handle_ready)
-
+        self.printer.add_object('probe', self)
+        
     def _handle_ready(self):
-        self.sensor.add_client(self._sensor_data_event)
-        self.add_client(self._track_force)
+        self._start_streaming()
         # announce calibration status on ready
         if self.is_calibrated():
             self.printer.send_event("load_cell:calibrate", self)
@@ -393,7 +424,9 @@ class LoadCell:
             self.printer.send_event("load_cell:tare", self)
 
     # convert raw counts to grams and broadcast to clients
-    def _sensor_data_event(self, msg):
+    def _add_measurement(self, msg):
+        if self._need_stop:
+            return False
         data = msg.get("data")
         errors = msg.get("errors")
         overflows = msg.get("overflows")
@@ -407,6 +440,21 @@ class LoadCell:
         msg = {'data': samples, 'errors': errors, 'overflows': overflows}
         self.clients.send(msg)
         return True
+    
+    def _start_streaming(self):
+        logging.info("load_cell _start_streaming")
+        if not self._need_stop:
+            return
+        self._need_stop = False
+        self.sensor.add_client(self._add_measurement)
+        self.add_client(self._track_force)
+        logging.info("load_cell add_client")
+        
+    def _finish_streaming(self):
+        logging.info("load_cell _stop_streaming")
+        self._need_stop = True
+        self._force_buffer.clear()
+        self._force_buffer_raw.clear()
 
     # get internal events of force data
     def add_client(self, callback):
@@ -449,9 +497,11 @@ class LoadCell:
     # read 1 second of load cell data and average it
     # performs safety checks for saturation
     def avg_counts(self, num_samples=None):
+        # self._start_streaming()
         if num_samples is None:
             num_samples = self.sensor.get_samples_per_second()
         samples, errors = self.get_collector().collect_min(num_samples)
+        # self._finish_streaming()
         if errors:
             raise self.printer.command_error(
                 "Sensor reported %i errors while sampling"
@@ -466,21 +516,42 @@ class LoadCell:
 
     # Provide ongoing force tracking/averaging for status updates
     def _track_force(self, msg):
-        if not (self.is_calibrated() and self.is_tared()):
+        if (not len(msg)):
             return True
         samples = msg['data']
         # selectColumn unusable here because Python 2 lacks deque.extend
-        for sample in samples:
-            self._force_buffer.append(sample[1])
+        if not (self.is_calibrated() and self.is_tared()):
+            for sample in samples:
+                self._force_buffer.append(sample[1])
+                self._force_buffer_raw.append(sample[2])
+        else:
+            for sample in samples:
+                self._force_buffer_raw.append(sample[2])
         return True
 
     def _force_g(self):
-        if (self.is_calibrated() and self.is_tared()
-                and len(self._force_buffer) > 0):
-            return {"force_g": round(avg(self._force_buffer), 1),
-                    "min_force_g": round(min(self._force_buffer), 1),
-                    "max_force_g": round(max(self._force_buffer), 1)}
-        return {}
+        state = {}
+        if (len(self._force_buffer_raw) > 0):
+            state.update({
+                "force_r": round(avg(self._force_buffer_raw), 1),
+                "min_force_r": round(min(self._force_buffer_raw), 1),
+                "max_force_r": round(max(self._force_buffer_raw), 1),
+            })
+        if ((self.is_calibrated()) and (self.is_tared())
+                and (len(self._force_buffer) > 0)):
+            state.update({
+                "force_g": round(avg(self._force_buffer), 1),
+                "min_force_g": round(min(self._force_buffer), 1),
+                "max_force_g": round(max(self._force_buffer), 1),
+            })
+        return state
+    def get_force_r(self):
+        res = 0
+        if (len(self._force_buffer_raw) > 0):
+            res = round(avg(self._force_buffer_raw), 1)
+        return res
+    def clear_force_r(self):
+        self._force_buffer_raw.clear()
 
     def is_tared(self):
         return self.tare_counts is not None
@@ -503,21 +574,304 @@ class LoadCell:
 
     def get_collector(self):
         return LoadCellSampleCollector(self.printer, self)
+    
+    def get_probe_params(self, gcmd=None):
+        return self.probe_session.get_probe_params(gcmd)
+    
+    def get_offsets(self):
+        return self.probe_offsets.get_offsets()
+    
+    def start_probe_session(self, gcmd):
+        return self.probe_session.start_probe_session(gcmd)
 
     def get_status(self, eventtime):
-        status = self._force_g()
-        status.update({'is_calibrated': self.is_calibrated(),
-                       'counts_per_gram': self.counts_per_gram,
-                       'reference_tare_counts': self.reference_tare_counts,
-                       'tare_counts': self.tare_counts})
+        status = dict(self.cmd_helper.get_status(eventtime))
+        status.update(self._force_g())
+        status.update({
+            'is_calibrated': self.is_calibrated(),
+            'counts_per_gram': self.counts_per_gram,
+            'reference_tare_counts': self.reference_tare_counts,
+            'tare_counts': self.tare_counts,
+        })
+        x_offset, y_offset, z_offset = self.get_offsets()
+        status.update({
+            'offsets': {'x': x_offset, 'y': y_offset, 'z': z_offset}
+        })
         return status
 
+class LoadCellEndstop:
+    REASON_SENSOR_ERROR = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
+    def __init__(self, config, load_cell, calibration=None):
+        self._printer = config.get_printer()
+        self.load_cell = load_cell
+        self._sensor_helper = load_cell.sensor
+        self._mcu = self._sensor_helper.get_mcu()
+        # self._calibration = calibration
+        self._dispatch = mcu.TriggerDispatch(self._mcu)
+        self._trigger_time = 0.
+        self.trigger_value_down = 0.
+        self.trigger_value_up = 0.
+        self.update_value_down = 0.
+        self.update_value_up = 0.
+        # self._gather = None
+        self.pressure_change_value = config.getint(
+            'pressure_change', 3000, minval=0
+        )
+        self.flexible_pressure_change = config.getint(
+            'flexible_pressure_change', self.pressure_change_value/2,
+            minval=0
+        )
+        self.calm_down = config.getfloat(
+            'time_for_calm_down', default=1.0, minval=0.1)
+        self.press_deformation_offset = config.getfloat(
+            'press_deformation_offset', minval=0.
+        )
+        # self._printer.register_event_handler(
+        #     "homing:home_rails_begin",
+        #     self._handle_home_rails_begin
+        # )
+        # self._printer.register_event_handler(
+        #     "homing:home_rails_end",
+        #     self._handle_home_rails_end
+        # )
+    def _handle_home_rails_begin(self, homing_state, rails):
+        logging.info("handle rails begin")
+        # self.load_cell._start_streaming()
+    def _handle_home_rails_end(self, homing_state, rails):
+        logging.info("handle rails end")
+        if 2 in homing_state.get_axes():
+            homing_state.set_homed_position(
+                [None, None, self.press_deformation_offset]
+            )
+        # self.load_cell._finish_streaming()
+    # Interface for MCU_endstop
+    def get_mcu(self):
+        return self._mcu
+    def add_stepper(self, stepper):
+        logging.info("load_cell_endstop:add_stepper:%s", stepper)
+        self._dispatch.add_stepper(stepper)
+    def get_steppers(self):
+        return self._dispatch.get_steppers()
+    def home_start(self, print_time, sample_time, sample_count, rest_time,
+                   triggered=True):
+        toolhead = self._printer.lookup_object("toolhead")
+        self._trigger_time = 0.
+        # 获取当前值
+        trigger_completion = self._dispatch.start(print_time)
+        max_wait_num = 5 # 最少等待5轮
+        min_calm_num = 3
+        wait_num = 0
+        wait_time = self._sensor_helper.get_bulk_update() * 2 # 每轮等待时间
+        if wait_time < 0.2:
+            # 最少等待5轮, 设定的平静时间越长, 等待越久
+            max_wait_num = int(self.calm_down/wait_time)
+            min_calm_num = min(max_wait_num/4, int(0.5/wait_time))
+        # reactor = self._printer.get_reactor()
+        toolhead.wait_moves()
+
+        # Reset the data before each detection?
+        need_update_data = 1
+        methods = 2
+        if (methods == 1):
+            range_min, range_max = self.load_cell.saturation_range()
+            self.load_cell.clear_force_r() # 清除旧数据的干扰
+            for the_i in range(max_wait_num):
+                # reactor.pause(reactor.monotonic() + wait_time)
+                current_value = int(self.load_cell.get_force_r())
+                if (range_min<current_value) and (current_value<range_max):
+                    need_update_data = 0
+                    break
+                toolhead.dwell(wait_time)
+            if (current_value <= range_min) or (current_value >= range_max):
+                raise self._printer.command_error(
+                    "Load_Cell: Invalid data has been detected: %d"
+                    % (current_value,))
+            trigger_value_down = current_value - self.pressure_change_value
+            trigger_value_up = current_value + self.pressure_change_value
+        elif (methods == 2):
+            for the_i in range(max_wait_num):
+                current_value = int(self.load_cell.get_force_r())
+                if (wait_num >= min_calm_num):
+                    need_update_data = 0
+                    break
+                elif (wait_num):
+                    if ((self.update_value_down < current_value) and
+                        (current_value < self.update_value_up)):
+                        wait_num += 1
+                    else:
+                        wait_num = 0
+                else:
+                    wait_num = 1
+                toolhead.dwell(wait_time)
+            if ((current_value <= self.trigger_value_down) or
+                (current_value >= self.trigger_value_up)):
+                raise self._printer.command_error(
+                    "Load_Cell: Invalid data has been detected: %d(%d~%d)"
+                    % (current_value, self.trigger_value_down,
+                    self.trigger_value_up))
+            if (need_update_data):
+                self.trigger_value_down = (current_value -
+                                           self.pressure_change_value)
+                self.trigger_value_up = (current_value +
+                                         self.pressure_change_value)
+                self.update_value_down = (current_value -
+                                          self.flexible_pressure_change)
+                self.update_value_up = (current_value +
+                                        self.flexible_pressure_change)
+                logging.info("update pressure change: %d" %
+                             (self.flexible_pressure_change))
+            trigger_value_down = self.trigger_value_down
+            trigger_value_up = self.trigger_value_up
+        else:
+            for the_i in range(max_wait_num):
+                # reactor.pause(reactor.monotonic() + wait_time)
+                current_value = int(self.load_cell.get_force_r())
+                if ((self.trigger_value_down < current_value) and
+                    (current_value < self.trigger_value_up)):
+                    need_update_data = 0
+                    break
+                toolhead.dwell(wait_time)
+            if ((current_value <= self.trigger_value_down) or
+                (current_value >= self.trigger_value_up)):
+                raise self._printer.command_error(
+                    "Load_Cell: Invalid data has been detected: %d(%d~%d)"
+                    % (current_value, self.trigger_value_down,
+                    self.trigger_value_up))
+            trigger_value_down = self.trigger_value_down
+            trigger_value_up = self.trigger_value_up
+
+        logging.info("home_start: cur:%d, wt:%.2f",
+                     current_value, wait_time*(the_i+1))
+        self._sensor_helper.setup_home(
+            self._dispatch.get_oid(), mcu.MCU_trsync.REASON_ENDSTOP_HIT,
+            mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1,
+            trigger_value_down, trigger_value_up)
+        # toolhead.dwell(wait_time)
+        # self._sensor_helper.setup_home(
+        #     self._dispatch.get_oid(), mcu.MCU_trsync.REASON_ENDSTOP_HIT,
+        #     mcu.MCU_trsync.REASON_COMMS_TIMEOUT+1,
+        #     self.pressure_change_value)
+        return trigger_completion
+    def home_wait(self, home_end_time):
+        self._dispatch.wait_end(home_end_time)
+        trigger_time = self._sensor_helper.clear_home()
+        res = self._dispatch.stop()
+        if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
+            if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
+                raise self._printer.command_error(
+                    "Communication timeout during homing")
+            raise self._printer.command_error("Eddy current sensor error")
+        if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+            return 0.
+        if self._mcu.is_fileoutput():
+            return home_end_time
+        self._trigger_time = trigger_time
+        return trigger_time
+        # return home_end_time
+
+    def query_endstop(self, print_time):
+        return False
+    # Interface for ProbeEndstopWrapper
+    def probing_move(self, pos, speed):
+        # Perform probing move
+        phoming = self._printer.lookup_object('homing')
+        return phoming.probing_move(self, pos, speed)
+        # trig_pos = phoming.probing_move(self, pos, speed)
+        # if not self._trigger_time:
+        #     return trig_pos
+        # Extract samples
+        # start_time = self._trigger_time + 0.050
+        # end_time = start_time + 0.100
+        # toolhead = self._printer.lookup_object("toolhead")
+        # toolhead_pos = toolhead.get_position()
+        # self._gather.note_probe(start_time, end_time, toolhead_pos)
+        # return self._gather.pull_probed()[0]
+    def multi_probe_begin(self):
+        # self.load_cell._start_streaming()
+        toolhead = self._printer.lookup_object("toolhead")
+        self._trigger_time = 0.
+        # 获取当前值
+        range_min, range_max = self.load_cell.saturation_range()
+        run_error = 0
+        max_wait_num = 5
+        min_calm_num = 3
+        wait_num = 0
+        wait_time = self._sensor_helper.get_bulk_update() * 2
+        if wait_time < 0.2:
+            max_wait_num = int(self.calm_down/wait_time)
+            # min number of clam down, max wait time is 0.5s
+            min_calm_num = min(max_wait_num/4, int(0.5/wait_time))
+        # reactor = self._printer.get_reactor()
+        toolhead.wait_moves()
+        self.load_cell.clear_force_r() # 清除旧数据的干扰
+        toolhead.dwell(0.5)
+        for the_i in range(max_wait_num):
+            current_value = int(self.load_cell.get_force_r())
+            # if (range_min < current_value) and (current_value < range_max):
+            #     break
+            if (wait_num >= min_calm_num):
+                # 数据稳定, 提前退出
+                break
+            elif (wait_num):
+                # 比较数据
+                if ((self.update_value_down < current_value) and
+                    (current_value < self.update_value_up)):
+                    wait_num += 1
+                else:
+                    # 重置记录
+                    # self.update_value_down = (current_value -
+                    #                           self.flexible_pressure_change)
+                    # self.update_value_up = (current_value +
+                    #                         self.flexible_pressure_change)
+                    # wait_num = 1
+
+                    # 重新记录
+                    wait_num = 0
+            else:
+                # 记录数据
+                self.update_value_down = (current_value -
+                                          self.flexible_pressure_change)
+                self.update_value_up = (current_value +
+                                        self.flexible_pressure_change)
+                wait_num = 1
+            toolhead.dwell(wait_time)
+        if (wait_num < min_calm_num):
+            raise self._printer.command_error(
+                "Load_Cell: The sensor can't calm down!"
+            )
+
+        if (current_value <= range_min) or (current_value >= range_max):
+            raise self._printer.command_error(
+                "Load_Cell: Invalid data has been detected: %d"
+                % (current_value,))
+        self.trigger_value_down = (current_value -
+                                   self.pressure_change_value)
+        self.trigger_value_up = (current_value +
+                                 self.pressure_change_value)
+        self.update_value_down = (current_value -
+                                  self.flexible_pressure_change)
+        self.update_value_up = (current_value +
+                                self.flexible_pressure_change)
+        logging.info("multi_pb: cur:%d, wt:%.2f, wait_num:%d",
+                     current_value, wait_time*(the_i+1), wait_num)
+        return 0
+    def multi_probe_end(self):
+        # self.load_cell._finish_streaming()
+        logging.info("multi_pe")
+        return 0
+    def probe_prepare(self, hmove):
+        pass
+    def probe_finish(self, hmove):
+        pass
+    def get_position_endstop(self):
+        return self.press_deformation_offset
 
 def load_config(config):
     # Sensor types
     sensors = {}
-    sensors.update(hx71x.HX71X_SENSOR_TYPES)
-    sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+    # sensors.update(hx71x.HX71X_SENSOR_TYPES)
+    # sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+    sensors.update(cs1237.CS1237_SENSOR_TYPES)
     sensor_class = config.getchoice('sensor_type', sensors)
     return LoadCell(config, sensor_class(config))
 
