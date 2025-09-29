@@ -400,10 +400,13 @@ class LoadCell:
                         {'normal': 1., 'inverted': -1.}, default="normal")
         LoadCellCommandHelper(config, self)
         # Probe interface
+        self.use_probe_command = config.getboolean('use_probe_command', True)
         self.mcu_probe = LoadCellEndstop(config, self)
-        self.cmd_helper = probe.ProbeCommandHelper(
-            config, self, self.mcu_probe.query_endstop)
-        self.probe_offsets = probe.ProbeOffsetsHelper(config)
+        if self.use_probe_command:
+            self.cmd_helper = probe.ProbeCommandHelper(
+                config, self, self.mcu_probe.query_endstop)
+            self.probe_offsets = probe.ProbeOffsetsHelper(config)
+        self.global_detection = config.getboolean('global_detection', True)
         self.probe_session = probe.ProbeSessionHelper(config, self.mcu_probe)
         # Client support:
         self.clients = ApiClientHelper(printer)
@@ -413,10 +416,12 @@ class LoadCell:
                                       "load_cell", self.name, header)
         # startup, when klippy is ready, start capturing data
         printer.register_event_handler("klippy:ready", self._handle_ready)
-        self.printer.add_object('probe', self)
+        probe_object_name = config.get('probe_object', "probe")
+        self.printer.add_object(probe_object_name, self)
         
     def _handle_ready(self):
-        self._start_streaming()
+        if self.global_detection:
+            self._start_streaming()
         # announce calibration status on ready
         if self.is_calibrated():
             self.printer.send_event("load_cell:calibrate", self)
@@ -579,13 +584,22 @@ class LoadCell:
         return self.probe_session.get_probe_params(gcmd)
     
     def get_offsets(self):
-        return self.probe_offsets.get_offsets()
+        if self.use_probe_command:
+            return self.probe_offsets.get_offsets()
+        else:
+            return [0,0,0]
     
     def start_probe_session(self, gcmd):
         return self.probe_session.start_probe_session(gcmd)
 
     def get_status(self, eventtime):
-        status = dict(self.cmd_helper.get_status(eventtime))
+        status = {}
+        if self.use_probe_command:
+            status.update(dict(self.cmd_helper.get_status(eventtime)))
+            x_offset, y_offset, z_offset = self.get_offsets()
+            status.update({
+                'offsets': {'x': x_offset, 'y': y_offset, 'z': z_offset}
+            })
         status.update(self._force_g())
         status.update({
             'is_calibrated': self.is_calibrated(),
@@ -593,14 +607,9 @@ class LoadCell:
             'reference_tare_counts': self.reference_tare_counts,
             'tare_counts': self.tare_counts,
         })
-        x_offset, y_offset, z_offset = self.get_offsets()
-        status.update({
-            'offsets': {'x': x_offset, 'y': y_offset, 'z': z_offset}
-        })
         return status
 
 class LoadCellEndstop:
-    REASON_SENSOR_ERROR = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
     def __init__(self, config, load_cell, calibration=None):
         self._printer = config.get_printer()
         self.load_cell = load_cell
@@ -608,11 +617,14 @@ class LoadCellEndstop:
         self._mcu = self._sensor_helper.get_mcu()
         # self._calibration = calibration
         self._dispatch = mcu.TriggerDispatch(self._mcu)
+        self.reason_endstop_trigger = mcu.MCU_trsync.REASON_ENDSTOP_HIT
+        self.reason_endstop_error = mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1
         self._trigger_time = 0.
         self.trigger_value_down = 0.
         self.trigger_value_up = 0.
         self.update_value_down = 0.
         self.update_value_up = 0.
+        self.probing_sample_count = 0
         # self._gather = None
         self.pressure_change_value = config.getint(
             'pressure_change', 3000, minval=0
@@ -641,7 +653,7 @@ class LoadCellEndstop:
         logging.info("handle rails end")
         if 2 in homing_state.get_axes():
             homing_state.set_homed_position(
-                [None, None, self.press_deformation_offset]
+                [None, None, -self.press_deformation_offset]
             )
         # self.load_cell._finish_streaming()
     # Interface for MCU_endstop
@@ -658,6 +670,14 @@ class LoadCellEndstop:
         self._trigger_time = 0.
         # 获取当前值
         trigger_completion = self._dispatch.start(print_time)
+        range_min, range_max = self.load_cell.saturation_range()
+        # toolhead.wait_moves()
+        if self.probing_sample_count > 0:
+            self._sensor_helper.setup_home(
+                self._dispatch.get_oid(),
+                self.reason_endstop_trigger, self.reason_endstop_error,
+                self.trigger_value_down, self.trigger_value_up)
+            return trigger_completion
         max_wait_num = 5 # 最少等待5轮
         min_calm_num = 3
         wait_num = 0
@@ -667,13 +687,11 @@ class LoadCellEndstop:
             max_wait_num = int(self.calm_down/wait_time)
             min_calm_num = min(max_wait_num/4, int(0.5/wait_time))
         # reactor = self._printer.get_reactor()
-        toolhead.wait_moves()
 
         # Reset the data before each detection?
         need_update_data = 1
         methods = 2
         if (methods == 1):
-            range_min, range_max = self.load_cell.saturation_range()
             self.load_cell.clear_force_r() # 清除旧数据的干扰
             for the_i in range(max_wait_num):
                 # reactor.pause(reactor.monotonic() + wait_time)
@@ -691,6 +709,22 @@ class LoadCellEndstop:
         elif (methods == 2):
             for the_i in range(max_wait_num):
                 current_value = int(self.load_cell.get_force_r())
+                if (range_min>=current_value) or (range_max<=current_value):
+                    raise self._printer.command_error(
+                        "Load_Cell: Out of range: %d"
+                        % (current_value,))
+                if ((self.trigger_value_down <= range_min) or
+                    (self.trigger_value_up >= range_max) or
+                    (self.update_value_down <= range_min) or
+                    (self.update_value_up >= range_max)):
+                    self.trigger_value_down = (current_value -
+                                               self.pressure_change_value)
+                    self.trigger_value_up = (current_value +
+                                             self.pressure_change_value)
+                    self.update_value_down = (current_value -
+                                              self.flexible_pressure_change)
+                    self.update_value_up = (current_value +
+                                            self.flexible_pressure_change)
                 if (wait_num >= min_calm_num):
                     need_update_data = 0
                     break
@@ -703,13 +737,14 @@ class LoadCellEndstop:
                 else:
                     wait_num = 1
                 toolhead.dwell(wait_time)
-            if ((current_value <= self.trigger_value_down) or
-                (current_value >= self.trigger_value_up)):
-                raise self._printer.command_error(
-                    "Load_Cell: Invalid data has been detected: %d(%d~%d)"
-                    % (current_value, self.trigger_value_down,
-                    self.trigger_value_up))
             if (need_update_data):
+                if ((current_value <= self.trigger_value_down) or
+                    (current_value >= self.trigger_value_up)):
+                    raise self._printer.command_error(
+                        "Load_Cell: Invalid data has been detected: %d(%d~%d)"
+                        " min_calm_num:%d"
+                        % (current_value, self.trigger_value_down,
+                        self.trigger_value_up, min_calm_num))
                 self.trigger_value_down = (current_value -
                                            self.pressure_change_value)
                 self.trigger_value_up = (current_value +
@@ -740,28 +775,28 @@ class LoadCellEndstop:
             trigger_value_down = self.trigger_value_down
             trigger_value_up = self.trigger_value_up
 
-        logging.info("home_start: cur:%d, wt:%.2f",
-                     current_value, wait_time*(the_i+1))
+        logging.info("home_start: cur:%d, wt:%.2f" %
+            (current_value, wait_time*(the_i+1)))
         self._sensor_helper.setup_home(
-            self._dispatch.get_oid(), mcu.MCU_trsync.REASON_ENDSTOP_HIT,
-            mcu.MCU_trsync.REASON_COMMS_TIMEOUT + 1,
+            self._dispatch.get_oid(),
+            self.reason_endstop_trigger, self.reason_endstop_error,
             trigger_value_down, trigger_value_up)
         # toolhead.dwell(wait_time)
         # self._sensor_helper.setup_home(
-        #     self._dispatch.get_oid(), mcu.MCU_trsync.REASON_ENDSTOP_HIT,
-        #     mcu.MCU_trsync.REASON_COMMS_TIMEOUT+1,
+        #     self._dispatch.get_oid(),
+        #     self.reason_endstop_trigger, self.reason_endstop_error,
         #     self.pressure_change_value)
         return trigger_completion
     def home_wait(self, home_end_time):
         self._dispatch.wait_end(home_end_time)
-        trigger_time = self._sensor_helper.clear_home()
         res = self._dispatch.stop()
+        trigger_time = self._sensor_helper.clear_home()
         if res >= mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
             if res == mcu.MCU_trsync.REASON_COMMS_TIMEOUT:
                 raise self._printer.command_error(
                     "Communication timeout during homing")
             raise self._printer.command_error("Eddy current sensor error")
-        if res != mcu.MCU_trsync.REASON_ENDSTOP_HIT:
+        if res != self.reason_endstop_trigger:
             return 0.
         if self._mcu.is_fileoutput():
             return home_end_time
@@ -774,8 +809,12 @@ class LoadCellEndstop:
     # Interface for ProbeEndstopWrapper
     def probing_move(self, pos, speed):
         # Perform probing move
+        self.probing_sample_count = 0
         phoming = self._printer.lookup_object('homing')
-        return phoming.probing_move(self, pos, speed)
+        epos = phoming.probing_move(self, pos, speed)
+        # Eliminate deformation caused by pressure
+        epos[2] += self.press_deformation_offset
+        return epos
         # trig_pos = phoming.probing_move(self, pos, speed)
         # if not self._trigger_time:
         #     return trig_pos
@@ -786,6 +825,14 @@ class LoadCellEndstop:
         # toolhead_pos = toolhead.get_position()
         # self._gather.note_probe(start_time, end_time, toolhead_pos)
         # return self._gather.pull_probed()[0]
+    def probing_move_2(self, pos, speed, count):
+        # Perform probing move
+        self.probing_sample_count = count
+        phoming = self._printer.lookup_object('homing')
+        epos = phoming.probing_move(self, pos, speed)
+        # Eliminate deformation caused by pressure
+        epos[2] += self.press_deformation_offset
+        return epos
     def multi_probe_begin(self):
         # self.load_cell._start_streaming()
         toolhead = self._printer.lookup_object("toolhead")
@@ -864,7 +911,7 @@ class LoadCellEndstop:
     def probe_finish(self, hmove):
         pass
     def get_position_endstop(self):
-        return self.press_deformation_offset
+        return -self.press_deformation_offset
 
 def load_config(config):
     # Sensor types

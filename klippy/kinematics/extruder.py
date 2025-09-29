@@ -144,7 +144,7 @@ class PrinterExtruder:
         # Setup kinematic checks
         self.nozzle_diameter = config.getfloat('nozzle_diameter', above=0.)
         filament_diameter = config.getfloat(
-            'filament_diameter', minval=self.nozzle_diameter)
+            'filament_diameter') # , minval=self.nozzle_diameter)
         self.filament_area = math.pi * (filament_diameter * .5)**2
         def_max_cross_section = 4. * self.nozzle_diameter**2
         def_max_extrude_ratio = def_max_cross_section / self.filament_area
@@ -291,10 +291,7 @@ class PrinterExtruder:
     
     #---------------------------------------------------------------------------
     def add_sync_stepper(self, name, obj):
-        if name in self.sync_steppers:
-            raise self.config_error(
-                "The '%s' stepper has been synchronized" % (name,))
-        self.sync_steppers[name] = obj
+        self.sync_steppers.update({name: obj})
     def del_sync_stepper(self, name):
         if name in self.sync_steppers:
             del self.sync_steppers[name]
