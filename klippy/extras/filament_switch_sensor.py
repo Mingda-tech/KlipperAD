@@ -48,13 +48,17 @@ class RunoutHelper:
         all_command_help = self.gcode.get_command_help()
         if self.runout_pause:
             if "CHECK_AND_SWITCH_EXTRUDER" in all_command_help:
+                # 不再提前调用 send_pause_command，
+                # 由 CHECK_AND_SWITCH_EXTRUDER 内部处理
                 pause_prefix = "CHECK_AND_SWITCH_EXTRUDER\n"
-                self.pause_delay = 0.0
+                # 使用局部变量，不修改实例的 pause_delay
+                cur_pause_delay = 0.0
             else:
                 pause_resume = self.printer.lookup_object('pause_resume')
                 pause_resume.send_pause_command()
                 pause_prefix = "PAUSE\n"
-            self.printer.get_reactor().pause(eventtime + self.pause_delay)
+                cur_pause_delay = self.pause_delay
+            self.printer.get_reactor().pause(eventtime + cur_pause_delay)
         self._exec_gcode(pause_prefix, self.runout_gcode)
     def _insert_event_handler(self, eventtime):
         self._exec_gcode("", self.insert_gcode)
@@ -79,14 +83,16 @@ class RunoutHelper:
         is_printing = idle_timeout.get_status(now)["state"] == "Printing"
         # Perform filament action associated with status change (if any)
         if is_filament_present:
-            if not is_printing and self.insert_gcode is not None:
+            if ((not self.runout_pause or not is_printing) and
+                 self.insert_gcode is not None):
                 # insert detected
                 self.min_event_systime = self.reactor.NEVER
                 logging.info(
                     "Filament Sensor %s: insert event detected, Time %.2f" %
                     (self.name, now))
                 self.reactor.register_callback(self._insert_event_handler)
-        elif is_printing and self.runout_gcode is not None:
+        elif ((not self.runout_pause or is_printing) and
+               self.runout_gcode is not None):
             # runout detected
             self.min_event_systime = self.reactor.NEVER
             logging.info(

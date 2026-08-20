@@ -96,6 +96,11 @@ class CS1237Base:
                self.dout_pin, self.sclk_pin, self.avg_num))
         mcu.add_config_cmd("query_cs1237 oid=%d rest_ticks=0"
                            % (self.oid,), on_restart=True)
+        
+        mcu.register_response(
+            self._handle_cs1237_home_state,
+            "cs1237_home_state_v2"
+        )
 
         mcu.register_config_callback(self._build_config)
 
@@ -116,6 +121,11 @@ class CS1237Base:
             "cs1237_home oid=%c trsync_oid=%c trigger_reason=%c "\
             "error_reason=%c threshold_down=%u threshold_up=%u hold_times=%c",
             # "error_reason=%c threshold=%u hold_times=%c",
+            cq=self.cmd_queue
+        )
+        self.cs1237_home_cmd_v2 = self.mcu.lookup_command(
+            "cs1237_home_v2 oid=%c trsync_oid=%c trigger_reason=%c "\
+            "error_reason=%c threshold=%u wait_tick=%u hold_times=%c",
             cq=self.cmd_queue
         )
         # stop home
@@ -239,6 +249,18 @@ class CS1237Base:
         self.debug_info("setup_home: %s" % (send_params,))
         # self.gcode.respond_info("setup_home: %s" % (send_params,))
         self.cs1237_home_cmd.send(send_params)
+    
+    def setup_home_v2(self, ts_oid, trigger_reason, error_reason, threshold,
+                      wait_time):
+        wait_tick = self.mcu.seconds_to_clock(wait_time)
+        send_params = [self.oid, ts_oid, trigger_reason, error_reason,
+             threshold, wait_tick, self.hold_times]
+        # self.debug_info("setup_home_v2: %s" % (send_params,))
+        logging.info("setup_home_v2: %s" % (send_params,))
+        self.cs1237_home_cmd_v2.send(send_params)
+        
+    def _handle_cs1237_home_state(self, params):
+        logging.info("cs1237_home_state_v2: %s" % (params,))
 
     def clear_home(self):
         send_params = [self.oid, 0, 0, 0, 0, 0, 0]
